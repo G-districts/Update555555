@@ -5,10 +5,9 @@
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from flask_cors import CORS
 import json, os, time, sqlite3, traceback, uuid, re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from datetime import datetime
 from collections import defaultdict
-from ai_routes import ai
 
 # ---------------------------
 # Flask App Initialization
@@ -16,9 +15,6 @@ from ai_routes import ai
 app = Flask(__name__, static_url_path="/static", static_folder="static", template_folder="templates")
 app.secret_key = os.environ.get("SECRET_KEY", "dev_secret_key")
 CORS(app, resources={r"/api/*": {"origins": "*"}})
-# Register AI classifier / chat blueprint
-app.register_blueprint(ai)
-
 
 def _ice_servers():
     # Always include Google STUN
@@ -304,6 +300,102 @@ def ai_get_categories():
 
 
 # ------------------------------------------
+# SAVE an AI category (used by Admin)
+# ------------------------------------------
+@app.route("/api/ai/category/save", methods=["POST"])
+def ai_category_save():
+    u = current_user()
+    if not u or u["role"] != "admin":
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    body = request.json or {}
+    name = body.get("name")
+    urls = body.get("urls") or []
+    bp = body.get("blockPage") or ""
+
+    if not name:
+        return jsonify({"ok": False, "error": "name required"}), 400
+
+    d = ensure_keys(load_data())
+    d["categories"][name] = {
+        "urls": urls,
+        "ai_labels": body.get("ai_labels", []),
+        "blockPage": bp
+    }
+
+    save_data(d)
+    return jsonify({"ok": True})
+
+
+# ------------------------------------------
+# DELETE AI category
+# ------------------------------------------
+@app.route("/api/ai/delete", methods=["POST"])
+def ai_category_delete():
+    u = current_user()
+    if not u or u["role"] != "admin":
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    body = request.json or {}
+    name = body.get("name")
+
+    d = ensure_keys(load_data())
+    if name in d["categories"]:
+        del d["categories"][name]
+        save_data(d)
+
+    return jsonify({"ok": True})
+
+
+# ------------------------------------------
+# EXTENSION → classify URL against categories
+# ------------------------------------------
+# (disabled legacy) @app.route("/api/ai/classify", methods=["POST"])
+def ai_classify():
+    body = request.json or {}
+    url = (body.get("url") or "").strip()
+
+    if not url:
+        return jsonify({"ok": False, "error": "no url"}), 400
+
+    d = ensure_keys(load_data())
+    cats = d.get("categories", {})
+
+    matched = None
+    reason = None
+
+    for name, cat in cats.items():
+        for pat in cat.get("urls", []):
+            if pat and pat.lower() in url.lower():
+                matched = name
+                reason = f"Matched pattern: {pat}"
+                break
+        if matched:
+            break
+
+    if not matched:
+        return jsonify({"ok": True, "blocked": False})
+
+    block_page = cats[matched].get("blockPage") or "category_block"
+
+    params = {
+        "url": url,
+        "policy": matched,
+        "rule": matched,
+        "path": block_page,
+        "bypass": 1
+    }
+
+    block_url = "https://blocked.gdistrict.org/Gschool%20block?" + urlencode(params)
+
+    return jsonify({
+        "ok": True,
+        "blocked": True,
+        "category": matched,
+        "reason": reason,
+        "redirect": block_url
+    })
+
 # =========================
 # Pages
 # =========================
@@ -673,6 +765,32 @@ def api_categories_delete():
         log_action({"event": "categories_delete", "name": name})
     return jsonify({"ok": True})
 
+
+# =========================
+# AI Category Helpers
+# =========================
+
+@app.route("/api/ai/categories", methods=["GET"])
+def api_ai_categories():
+    """
+    Proxy AI category listing to the ai_routes module so we return
+    the classifier-backed categories (from sqlite) instead of the
+    legacy data.json categories.
+    """
+    from ai_routes import categories as _ai_categories
+    return _ai_categories()
+
+@app.route("/api/ai/classify", methods=["POST"])
+def api_ai_classify():
+    """
+    Proxy AI URL classification to the ai_routes.api_classify view
+    so the response has the expected shape:
+      { "ok": true, "url": ..., "result": {...}, "blocked": false, "block_url": "" }
+    This keeps the Chrome extension and admin UI working with the
+    newer classifier pipeline.
+    """
+    from ai_routes import api_classify as _ai_classify
+    return _ai_classify()
 
 # =========================
 # Class / Teacher Controls
@@ -1208,7 +1326,6 @@ def _apply_policy_to_lists(base_allow, base_blocks, base_categories, policy):
 
 
 @app.route("/api/policy", methods=["POST"])
-@app.route("/api/policy", methods=["POST"])
 def api_policy():
     b = request.json or {}
     student = (b.get("student") or "").strip()
@@ -1247,28 +1364,6 @@ def api_policy():
         current_list = [c for c in current_raw if c]
     else:
         current_list = []
-
-    # Filter scenes based on per-student targeting, if present.
-    if current_list:
-        if student:
-            # For a specific student, include scenes that either:
-            # - have no explicit "students" list (apply to whole class), or
-            # - include this student in their "students" list, or
-            # - use ["*"] to mean whole class.
-            filtered = []
-            for c in current_list:
-                targets = c.get("students")
-                if not targets:
-                    filtered.append(c)
-                    continue
-                if isinstance(targets, list):
-                    norm = [str(s).strip().lower() for s in targets if str(s).strip()]
-                    if "*" in norm or student.lower() in norm:
-                        filtered.append(c)
-            current_list = filtered
-        else:
-            # No specific student: only include global scenes (no "students" key).
-            current_list = [c for c in current_list if not c.get("students")]
 
     # Start with class-level lists
     allowlist = list(cls.get("allowlist", []))
@@ -1820,7 +1915,6 @@ def api_scenes_import():
 
 @app.route("/api/scenes/apply", methods=["POST"])
 @app.route("/api/scenes/apply", methods=["POST"])
-@app.route("/api/scenes/apply", methods=["POST"])
 def api_scenes_apply():
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
@@ -1830,12 +1924,6 @@ def api_scenes_apply():
     sid = body.get("id") or body.get("scene_id")
     disable = bool(body.get("disable", False))
     replace_mode = bool(body.get("replace", False))
-
-    # Optional per-student targeting for this scene
-    targets = body.get("students") or []
-    if isinstance(targets, str):
-        targets = [targets]
-    targets = [str(s).strip() for s in targets if str(s).strip()]
 
     store = _load_scenes()
 
@@ -1873,22 +1961,16 @@ def api_scenes_apply():
     else:
         current_list = []
 
-    # Attach target students (if any) to the scene being applied
-    targeted = dict(found)
-    if targets:
-        targeted["students"] = targets
-
     if replace_mode:
-        # Replace any existing scenes with this one
-        current_list = [targeted]
+        current_list = [found]
     else:
-        # Keep existing applied scenes and append this one (allow multiple scenes / per-student variants)
-        current_list = list(current_list)
-        current_list.append(targeted)
+        existing_ids = {str(c.get("id")) for c in current_list}
+        if str(found.get("id")) not in existing_ids:
+            current_list.append(found)
 
     store["current"] = current_list
     _save_scenes(store)
-    log_action({"event": "scene_applied", "scene": targeted})
+    log_action({"event": "scene_applied", "scene": found})
 
     d = ensure_keys(load_data())
     d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "policy_refresh"})
